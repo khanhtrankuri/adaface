@@ -9,21 +9,32 @@ from torch.nn import BatchNorm1d, BatchNorm2d
 from torch.nn import ReLU, Sigmoid
 from torch.nn import Module
 from torch.nn import PReLU
-import os
+
 
 def build_model(model_name='ir_50'):
-    if model_name == 'ir_101':
-        return IR_101(input_size=(112,112))
-    elif model_name == 'ir_50':
-        return IR_50(input_size=(112,112))
-    elif model_name == 'ir_se_50':
-        return IR_SE_50(input_size=(112,112))
-    elif model_name == 'ir_34':
-        return IR_34(input_size=(112,112))
-    elif model_name == 'ir_18':
-        return IR_18(input_size=(112,112))
-    else:
-        raise ValueError('not a correct model name', model_name)
+    """Build an AdaFace backbone.
+
+    Names ending in ``_dla`` use Conv-BN residual blocks.  They are intended for
+    a newly trained (or fine-tuned) TensorRT/DLA model and deliberately do not
+    share the exact graph of the published, pre-activation checkpoints.
+    """
+    builders = {
+        'ir_18': IR_18,
+        'ir_34': IR_34,
+        'ir_50': IR_50,
+        'ir_101': IR_101,
+        'ir_se_50': IR_SE_50,
+        'ir_18_dla': IR_18_DLA,
+        'ir_34_dla': IR_34_DLA,
+        'ir_50_dla': IR_50_DLA,
+        'ir_101_dla': IR_101_DLA,
+        'ir_se_50_dla': IR_SE_50_DLA,
+    }
+    try:
+        builder = builders[model_name]
+    except KeyError:
+        raise ValueError('not a correct model name: {}'.format(model_name))
+    return builder(input_size=(112, 112))
 
 def initialize_weights(modules):
     """ Weight initilize, conv2d and linear is initialized with kaiming_normal
@@ -44,6 +55,49 @@ def initialize_weights(modules):
                                     nonlinearity='relu')
             if m.bias is not None:
                 m.bias.data.zero_()
+
+
+def convert_legacy_state_dict_for_dla(state_dict):
+    """Remap a legacy backbone state dict to initialize a DLA backbone.
+
+    The pre-convolution BN in every residual branch and the pre-linear BN in
+    the output head have no equivalent in the new graph, so those tensors are
+    discarded.  The returned weights are only an initialization and require
+    fine-tuning plus fresh INT8 calibration.
+    """
+    converted = {}
+    for key, value in state_dict.items():
+        new_key = key
+
+        if '.res_layer.' in key:
+            prefix, suffix = key.split('.res_layer.', 1)
+            module_index, separator, parameter_name = suffix.partition('.')
+            if module_index.isdigit():
+                module_index = int(module_index)
+                if module_index == 0:
+                    continue
+                new_key = '{}.res_layer.{}'.format(prefix, module_index - 1)
+                if separator:
+                    new_key += '.' + parameter_name
+
+        if 'output_layer.' in new_key:
+            prefix, suffix = new_key.split('output_layer.', 1)
+            module_index, separator, parameter_name = suffix.partition('.')
+            if module_index.isdigit():
+                module_index = int(module_index)
+                if module_index == 0:
+                    continue
+                # Dropout and Flatten have no tensors. Only Linear (3 -> 2)
+                # and the final BatchNorm1d (4 -> 3) reach this branch.
+                if module_index >= 3:
+                    module_index -= 1
+                new_key = '{}output_layer.{}'.format(prefix, module_index)
+                if separator:
+                    new_key += '.' + parameter_name
+
+        converted[new_key] = value
+
+    return converted
 
 
 class Flatten(Module):
@@ -165,6 +219,32 @@ class BasicBlockIR(Module):
         return res + shortcut
 
 
+class BasicBlockIRDLA(Module):
+    """Post-normalization IR block for TensorRT/DLA deployment.
+
+    Unlike the published IR block, every normalization in the residual branch
+    follows a convolution.  TensorRT can therefore fold Conv-BN pairs during
+    engine construction and calibrate them as a single weighted operation.
+    """
+    def __init__(self, in_channel, depth, stride):
+        super(BasicBlockIRDLA, self).__init__()
+        if in_channel == depth:
+            self.shortcut_layer = MaxPool2d(1, stride)
+        else:
+            self.shortcut_layer = Sequential(
+                Conv2d(in_channel, depth, (1, 1), stride, bias=False),
+                BatchNorm2d(depth))
+        self.res_layer = Sequential(
+            Conv2d(in_channel, depth, (3, 3), (1, 1), 1, bias=False),
+            BatchNorm2d(depth),
+            PReLU(depth),
+            Conv2d(depth, depth, (3, 3), stride, 1, bias=False),
+            BatchNorm2d(depth))
+
+    def forward(self, x):
+        return self.res_layer(x) + self.shortcut_layer(x)
+
+
 class BottleneckIR(Module):
     """ BasicBlock with bottleneck for IRNet
     """
@@ -195,6 +275,31 @@ class BottleneckIR(Module):
         return res + shortcut
 
 
+class BottleneckIRDLA(Module):
+    """Post-normalization bottleneck used by the large DLA backbones."""
+    def __init__(self, in_channel, depth, stride):
+        super(BottleneckIRDLA, self).__init__()
+        reduction_channel = depth // 4
+        if in_channel == depth:
+            self.shortcut_layer = MaxPool2d(1, stride)
+        else:
+            self.shortcut_layer = Sequential(
+                Conv2d(in_channel, depth, (1, 1), stride, bias=False),
+                BatchNorm2d(depth))
+        self.res_layer = Sequential(
+            Conv2d(in_channel, reduction_channel, (1, 1), (1, 1), 0, bias=False),
+            BatchNorm2d(reduction_channel),
+            PReLU(reduction_channel),
+            Conv2d(reduction_channel, reduction_channel, (3, 3), (1, 1), 1, bias=False),
+            BatchNorm2d(reduction_channel),
+            PReLU(reduction_channel),
+            Conv2d(reduction_channel, depth, (1, 1), stride, 0, bias=False),
+            BatchNorm2d(depth))
+
+    def forward(self, x):
+        return self.res_layer(x) + self.shortcut_layer(x)
+
+
 class BasicBlockIRSE(BasicBlockIR):
     def __init__(self, in_channel, depth, stride):
         super(BasicBlockIRSE, self).__init__(in_channel, depth, stride)
@@ -204,6 +309,18 @@ class BasicBlockIRSE(BasicBlockIR):
 class BottleneckIRSE(BottleneckIR):
     def __init__(self, in_channel, depth, stride):
         super(BottleneckIRSE, self).__init__(in_channel, depth, stride)
+        self.res_layer.add_module("se_block", SEModule(depth, 16))
+
+
+class BasicBlockIRSEDLA(BasicBlockIRDLA):
+    def __init__(self, in_channel, depth, stride):
+        super(BasicBlockIRSEDLA, self).__init__(in_channel, depth, stride)
+        self.res_layer.add_module("se_block", SEModule(depth, 16))
+
+
+class BottleneckIRSEDLA(BottleneckIRDLA):
+    def __init__(self, in_channel, depth, stride):
+        super(BottleneckIRSEDLA, self).__init__(in_channel, depth, stride)
         self.res_layer.add_module("se_block", SEModule(depth, 16))
 
 
@@ -265,11 +382,13 @@ def get_blocks(num_layers):
 
 
 class Backbone(Module):
-    def __init__(self, input_size, num_layers, mode='ir'):
+    def __init__(self, input_size, num_layers, mode='ir', block_layout='legacy'):
         """ Args:
             input_size: input_size of backbone
             num_layers: num_layers of backbone
-            mode: support ir or irse
+            mode: support ir or ir_se
+            block_layout: ``legacy`` keeps the published BN-Conv graph;
+                ``dla`` uses foldable Conv-BN pairs.
         """
         super(Backbone, self).__init__()
         assert input_size[0] in [112, 224], \
@@ -278,32 +397,43 @@ class Backbone(Module):
             "num_layers should be 18, 34, 50, 100 or 152"
         assert mode in ['ir', 'ir_se'], \
             "mode should be ir or ir_se"
+        assert block_layout in ['legacy', 'dla'], \
+            "block_layout should be legacy or dla"
+        self.block_layout = block_layout
         self.input_layer = Sequential(Conv2d(3, 64, (3, 3), 1, 1, bias=False),
                                       BatchNorm2d(64), PReLU(64))
         blocks = get_blocks(num_layers)
         if num_layers <= 100:
-            if mode == 'ir':
+            if mode == 'ir' and block_layout == 'legacy':
                 unit_module = BasicBlockIR
-            elif mode == 'ir_se':
+            elif mode == 'ir_se' and block_layout == 'legacy':
                 unit_module = BasicBlockIRSE
+            elif mode == 'ir':
+                unit_module = BasicBlockIRDLA
+            else:
+                unit_module = BasicBlockIRSEDLA
             output_channel = 512
         else:
-            if mode == 'ir':
+            if mode == 'ir' and block_layout == 'legacy':
                 unit_module = BottleneckIR
-            elif mode == 'ir_se':
+            elif mode == 'ir_se' and block_layout == 'legacy':
                 unit_module = BottleneckIRSE
+            elif mode == 'ir':
+                unit_module = BottleneckIRDLA
+            else:
+                unit_module = BottleneckIRSEDLA
             output_channel = 2048
 
+        output_modules = []
+        if block_layout == 'legacy':
+            output_modules.append(BatchNorm2d(output_channel))
+        output_modules.extend([Dropout(0.4), Flatten()])
         if input_size[0] == 112:
-            self.output_layer = Sequential(BatchNorm2d(output_channel),
-                                        Dropout(0.4), Flatten(),
-                                        Linear(output_channel * 7 * 7, 512),
-                                        BatchNorm1d(512, affine=False))
+            output_modules.append(Linear(output_channel * 7 * 7, 512))
         else:
-            self.output_layer = Sequential(
-                BatchNorm2d(output_channel), Dropout(0.4), Flatten(),
-                Linear(output_channel * 14 * 14, 512),
-                BatchNorm1d(512, affine=False))
+            output_modules.append(Linear(output_channel * 14 * 14, 512))
+        output_modules.append(BatchNorm1d(512, affine=False))
+        self.output_layer = Sequential(*output_modules)
 
         modules = []
         for block in blocks:
@@ -316,20 +446,41 @@ class Backbone(Module):
         initialize_weights(self.modules())
 
 
-    def forward(self, x):
-        
-        # current code only supports one extra image
-        # it comes with a extra dimension for number of extra image. We will just squeeze it out for now
+    def forward_embedding(self, x):
+        """Return the unnormalized embedding.
+
+        Export this method through :class:`DLAEmbeddingModel` and perform L2
+        normalization/cosine similarity in FP32 outside DLA.  A sum reduction is
+        otherwise likely to be quantized or moved to a GPU fallback subgraph.
+        """
         x = self.input_layer(x)
+        x = self.body(x)
+        return self.output_layer(x)
 
-        for idx, module in enumerate(self.body):
-            x = module(x)
+    def forward(self, x):
+        x = self.forward_embedding(x)
+        if self.block_layout == 'legacy':
+            norm = torch.norm(x, 2, 1, True)
+            return torch.div(x, norm), norm
 
-        x = self.output_layer(x)
-        norm = torch.norm(x, 2, 1, True)
-        output = torch.div(x, norm)
-
+        # FP32 accumulation prevents overflow/underflow in FP16. Keep this out of
+        # an INT8 DLA engine by exporting DLAEmbeddingModel instead.
+        fp32_embedding = x.float()
+        norm = torch.norm(fp32_embedding, 2, 1, True).clamp_min(1e-12)
+        output = torch.div(fp32_embedding, norm)
         return output, norm
+
+
+class DLAEmbeddingModel(Module):
+    """Export wrapper that leaves L2 normalization and cosine outside DLA."""
+    def __init__(self, backbone):
+        super(DLAEmbeddingModel, self).__init__()
+        if backbone.block_layout != 'dla':
+            raise ValueError('DLAEmbeddingModel requires a *_dla backbone')
+        self.backbone = backbone
+
+    def forward(self, x):
+        return self.backbone.forward_embedding(x)
 
 
 
@@ -411,4 +562,24 @@ def IR_SE_200(input_size):
     model = Backbone(input_size, 200, 'ir_se')
 
     return model
+
+
+def IR_18_DLA(input_size):
+    return Backbone(input_size, 18, 'ir', block_layout='dla')
+
+
+def IR_34_DLA(input_size):
+    return Backbone(input_size, 34, 'ir', block_layout='dla')
+
+
+def IR_50_DLA(input_size):
+    return Backbone(input_size, 50, 'ir', block_layout='dla')
+
+
+def IR_101_DLA(input_size):
+    return Backbone(input_size, 100, 'ir', block_layout='dla')
+
+
+def IR_SE_50_DLA(input_size):
+    return Backbone(input_size, 50, 'ir_se', block_layout='dla')
 

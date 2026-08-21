@@ -13,6 +13,16 @@ import train_val
 import data
 import inspect
 
+
+def resolve_precision(args):
+    if args.use_16bit and args.precision != '32':
+        raise ValueError('use either --use_16bit or --precision, not both')
+    if args.use_16bit:
+        return 16
+    if args.precision == 'bf16':
+        return 'bf16'
+    return int(args.precision)
+
 def main(args):
 
     hparams = dotdict(vars(args))
@@ -39,6 +49,11 @@ def main(args):
         my_loggers.append(wandb_logger)
 
     resume_from_checkpoint = hparams.resume_from_checkpoint if hparams.resume_from_checkpoint else None
+    # DDP defaults to NCCL, which is unavailable on native Windows. It is also
+    # unnecessary for a single GPU, so let Lightning select its single-device
+    # strategy in that case.
+    strategy = hparams.distributed_backend if hparams.gpus > 1 else None
+    precision = resolve_precision(args)
 
     params = inspect.signature(pl.Trainer).parameters.values()
     if 'strategy' in [param.name for param in params]:
@@ -49,8 +64,8 @@ def main(args):
                              gpus=hparams.gpus,
                              max_epochs=hparams.epochs,
                              accelerator='cpu' if hparams.gpus == 0 else 'gpu',
-                             strategy=hparams.distributed_backend,
-                             precision=16 if hparams.use_16bit else 32,
+                             strategy=strategy,
+                             precision=precision,
                              fast_dev_run=hparams.fast_dev_run,
                              callbacks=[checkpoint_callback],
                              num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
@@ -66,7 +81,7 @@ def main(args):
                              gpus=hparams.gpus,
                              max_epochs=hparams.epochs,
                              accelerator=hparams.distributed_backend,
-                             precision=16 if hparams.use_16bit else 32,
+                             precision=precision,
                              fast_dev_run=hparams.fast_dev_run,
                              callbacks=[checkpoint_callback],
                              num_sanity_val_steps=16 if hparams.batch_size > 63 else 100,
@@ -79,6 +94,9 @@ def main(args):
         # train / val
         print('start training')
         trainer.fit(trainer_mod, data_mod)
+        if hparams.fast_dev_run:
+            print('fast_dev_run finished; skipping checkpoint-based test')
+            return
         print('start evaluating')
         print('evaluating from ', checkpoint_callback.best_model_path)
         trainer.test(ckpt_path='best', datamodule=data_mod)
@@ -97,6 +115,8 @@ if __name__ == '__main__':
         # DistributedDataParallel, we need to divide the batch size
         # ourselves based on the total number of GPUs we have
         torch.set_num_threads(1)
+        if args.batch_size % args.gpus != 0:
+            raise ValueError('--batch_size must be divisible by --gpus for DDP')
         args.total_batch_size = args.batch_size
         args.batch_size = int(args.batch_size / max(1, args.gpus))
         args.num_workers = min(args.num_workers, 16)

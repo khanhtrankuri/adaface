@@ -1,13 +1,20 @@
 import os
+import math
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from torchvision import transforms
+import webdataset as wds
 import numpy as np
 import pandas as pd
 import evaluate_utils
+import utils
 from dataset.image_folder_dataset import CustomImageFolderDataset
 from dataset.five_validation_dataset import FiveValidationDataset
-from dataset.record_dataset import AugmentRecordDataset
+from dataset.webdataset_dataset import (
+    FaceWebDatasetTransform,
+    build_face_webdataset,
+    find_webdataset_shards,
+)
 
 
 class DataModule(pl.LightningDataModule):
@@ -27,6 +34,19 @@ class DataModule(pl.LightningDataModule):
         self.photometric_augmentation_prob = kwargs['photometric_augmentation_prob']
         self.swap_color_channel = kwargs['swap_color_channel']
         self.use_mxrecord = kwargs['use_mxrecord']
+        self.use_webdataset = kwargs.get('use_webdataset', False)
+        self.webdataset_pattern = kwargs.get(
+            'webdataset_pattern', 'glint360k_train-*.tar')
+        self.train_num_samples = kwargs.get('train_num_samples', -1)
+        self.webdataset_shuffle_buffer = kwargs.get(
+            'webdataset_shuffle_buffer', 20000)
+        self.seed = kwargs.get('seed', 42)
+
+        if self.use_mxrecord and self.use_webdataset:
+            raise ValueError('--use_mxrecord and --use_webdataset are mutually exclusive')
+        if self.use_webdataset and self.train_num_samples <= 0:
+            raise ValueError(
+                '--train_num_samples must be positive when using WebDataset')
 
         concat_mem_file_name = os.path.join(self.data_root, self.val_data_path, 'concat_validation_memfile')
         self.concat_mem_file_name = concat_mem_file_name
@@ -61,7 +81,11 @@ class DataModule(pl.LightningDataModule):
                                                self.photometric_augmentation_prob,
                                                self.swap_color_channel,
                                                self.use_mxrecord,
-                                               self.output_dir
+                                               self.output_dir,
+                                               use_webdataset=self.use_webdataset,
+                                               webdataset_pattern=self.webdataset_pattern,
+                                               webdataset_shuffle_buffer=self.webdataset_shuffle_buffer,
+                                               seed=self.seed,
                                                )
 
             if 'faces_emore' in self.train_data_path and self.train_data_subset:
@@ -78,13 +102,54 @@ class DataModule(pl.LightningDataModule):
             self.test_dataset = test_dataset(self.data_root, self.val_data_path, self.concat_mem_file_name)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+        if self.use_webdataset:
+            world_size = utils.get_world_size()
+            global_batch_size = self.batch_size * world_size
+            batches_per_rank = int(math.ceil(
+                self.train_num_samples / float(global_batch_size)))
+            dataset = self.train_dataset.batched(
+                self.batch_size, partial=False)
+            loader = wds.WebLoader(
+                dataset,
+                batch_size=None,
+                num_workers=self.num_workers,
+                pin_memory=True,
+                persistent_workers=self.num_workers > 0,
+            )
+            loader = loader.with_epoch(batches_per_rank).with_length(
+                batches_per_rank)
+            print('WebDataset batches per rank:', batches_per_rank)
+            return loader
+
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+        )
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False)
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
+        )
 
     def subset_ms1mv2_dataset(self, subset_index):
         # remove too few example identites
@@ -124,7 +189,11 @@ def train_dataset(data_root, train_data_path,
                   photometric_augmentation_prob,
                   swap_color_channel,
                   use_mxrecord,
-                  output_dir):
+                  output_dir,
+                  use_webdataset=False,
+                  webdataset_pattern='glint360k_train-*.tar',
+                  webdataset_shuffle_buffer=20000,
+                  seed=42):
 
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(),
@@ -132,7 +201,29 @@ def train_dataset(data_root, train_data_path,
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
 
-    if use_mxrecord:
+    if use_webdataset:
+        shards = find_webdataset_shards(
+            data_root, train_data_path, webdataset_pattern)
+        print('WebDataset shard count:', len(shards))
+        image_transform = FaceWebDatasetTransform(
+            transform=train_transform,
+            low_res_augmentation_prob=low_res_augmentation_prob,
+            crop_augmentation_prob=crop_augmentation_prob,
+            photometric_augmentation_prob=photometric_augmentation_prob,
+            swap_color_channel=swap_color_channel,
+            output_dir=output_dir,
+        )
+        train_dataset = build_face_webdataset(
+            shards=shards,
+            image_transform=image_transform,
+            shuffle_buffer=webdataset_shuffle_buffer,
+            seed=seed,
+        )
+    elif use_mxrecord:
+        # MXNet is only needed for legacy RecordIO datasets. Import it lazily
+        # so Glint360K WebDataset training does not depend on MXNet 1.x.
+        from dataset.record_dataset import AugmentRecordDataset
+
         train_dir = os.path.join(data_root, train_data_path)
         train_dataset = AugmentRecordDataset(root_dir=train_dir,
                                              transform=train_transform,

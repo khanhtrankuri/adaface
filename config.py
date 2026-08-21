@@ -10,12 +10,22 @@ def get_args():
     parent_parser.add_argument('--train_data_path', type=str, default='faces_emore/imgs')
     parent_parser.add_argument('--val_data_path', type=str, default='faces_emore')
     parent_parser.add_argument('--use_mxrecord', action='store_true')
+    parent_parser.add_argument('--use_webdataset', action='store_true',
+                               help='read sharded .tar files directly with WebDataset')
+    parent_parser.add_argument('--webdataset_pattern', type=str,
+                               default='glint360k_train-*.tar',
+                               help='TAR glob relative to data_root/train_data_path')
+    parent_parser.add_argument('--train_num_samples', type=int, default=-1,
+                               help='global samples per epoch; required for WebDataset')
+    parent_parser.add_argument('--webdataset_shuffle_buffer', type=int, default=20000)
     parent_parser.add_argument('--train_data_subset', action='store_true')
     parent_parser.add_argument('--swap_color_channel', action='store_true')
     parent_parser.add_argument('--prefix', type=str, default='default')
     parent_parser.add_argument('--gpus', type=int, default=1, help='how many gpus')
     parent_parser.add_argument('--distributed_backend', type=str, default='ddp', choices=('dp', 'ddp', 'ddp2'),)
     parent_parser.add_argument('--use_16bit', action='store_true', help='if true uses 16 bit precision')
+    parent_parser.add_argument('--precision', default='32', choices=('32', '16', 'bf16'),
+                               help='training precision; bf16 is recommended on H100/H200')
     parent_parser.add_argument('--epochs', default=24, type=int, metavar='N', help='number of total epochs to run')
     parent_parser.add_argument('--seed', type=int, default=42, help='seed for initializing training.')
     parent_parser.add_argument('--batch_size', default=256, type=int,
@@ -54,7 +64,10 @@ def get_args():
 
 
 def add_task_arguments(parser):
-    parser.add_argument('--arch', default='ir_18')
+    parser.add_argument(
+        '--arch', default='ir_18',
+        help='backbone name; use ir_18_dla, ir_34_dla, ir_50_dla, '
+             'ir_101_dla, or ir_se_50_dla for the Conv-BN DLA layout')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M')
     parser.add_argument('--weight_decay', default=1e-4, type=float)
 

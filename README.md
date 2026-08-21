@@ -154,6 +154,12 @@ bgr_input = to_input(aligned_rgb_img)
 feature, _ = model(bgr_input)
 ```
 
+For TensorRT DLA FP16/INT8 deployment, use the Conv-BN backbone and raw-embedding
+export workflow described in [README_DLA.md](README_DLA.md).
+
+For direct TAR-shard training on Glint360K, see
+[README_GLINT360K.md](README_GLINT360K.md).
+
 - Note that AdaFace model is a vanilla pytorch model which takes in `bgr_input` which is 112x112x3 
 torch tensor with BGR color channel whose value is normalized with `mean=0.5` and `std=0.5`, 
 as in [to_input()](https://github.com/mk-minchul/AdaFace/blob/d8114b3ca8c54cd81ef59ac34c19eda1c548ca17/inference.py#L22)

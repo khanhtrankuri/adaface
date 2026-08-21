@@ -1,8 +1,37 @@
+# The CUDA/BF16 training path was smoke-tested with Python 3.10. Glint360K TAR
+# training does not require MXNet. Only install MXNet for legacy --use_mxrecord
+# jobs; its Windows wheel declares obsolete dependency constraints:
+#
+#   python -m pip install --no-deps mxnet==1.7.0.post2
+#   python -m pip install -r requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+# CUDA / training
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
 pytorch-lightning==1.8.6
-pytorch<=1.13.1
-tqdm
-bcolz-zipline
-prettytable
-menpo
-mxnet
-opencv-python
+torchmetrics==0.11.4
+tensorboardX==2.6.5
+onnx==1.17.0
+
+# MXNet 1.x compatibility
+numpy==1.23.5
+
+# Dataset and image processing
+bcolz-zipline==1.13.0
+opencv-python==4.8.1.78
+Pillow==12.3.0
+pandas==2.3.3
+webdataset==1.0.2
+braceexpand==0.1.7
+huggingface_hub==1.28.0
+
+# Validation and reporting
+scipy==1.15.3
+scikit-learn==1.5.2
+tqdm==4.70.0
+prettytable==3.18.0
+menpo==0.11.1
+
+# Optional: install `wandb` only when training with --use_wandb.

@@ -54,10 +54,15 @@ class Trainer(LightningModule):
         if scheduler is None:
             raise ValueError('lr calculation not successful')
 
-        if isinstance(scheduler, lr_scheduler._LRScheduler):
+        # PyTorch 2.x moved schedulers away from the private _LRScheduler
+        # hierarchy. Prefer the public capability so this works on both old
+        # and new PyTorch releases.
+        if hasattr(scheduler, 'get_last_lr'):
             lr = scheduler.get_last_lr()[0]
-        else:
+        elif hasattr(scheduler, 'get_epoch_values'):
             lr = scheduler.get_epoch_values(self.current_epoch)[0]
+        else:
+            lr = scheduler.optimizer.param_groups[0]['lr']
         return lr
 
 
@@ -127,7 +132,13 @@ class Trainer(LightningModule):
             embeddings = all_output_tensor[all_dataname_tensor == dataname_idx].to('cpu').numpy()
             labels = all_target_tensor[all_dataname_tensor == dataname_idx].to('cpu').numpy()
             issame = labels[0::2]
-            tpr, fpr, accuracy, best_thresholds = evaluate_utils.evaluate(embeddings, issame, nrof_folds=10)
+            # Small smoke-test/limited validation runs may contain fewer than
+            # ten verification pairs. Full validation still uses 10 folds.
+            nrof_folds = min(10, len(issame))
+            if nrof_folds < 2:
+                continue
+            tpr, fpr, accuracy, best_thresholds = evaluate_utils.evaluate(
+                embeddings, issame, nrof_folds=nrof_folds)
             acc, best_threshold = accuracy.mean(), best_thresholds.mean()
 
             num_val_samples = len(embeddings)
@@ -162,7 +173,11 @@ class Trainer(LightningModule):
             embeddings = all_output_tensor[all_dataname_tensor == dataname_idx].to('cpu').numpy()
             labels = all_target_tensor[all_dataname_tensor == dataname_idx].to('cpu').numpy()
             issame = labels[0::2]
-            tpr, fpr, accuracy, best_thresholds = evaluate_utils.evaluate(embeddings, issame, nrof_folds=10)
+            nrof_folds = min(10, len(issame))
+            if nrof_folds < 2:
+                continue
+            tpr, fpr, accuracy, best_thresholds = evaluate_utils.evaluate(
+                embeddings, issame, nrof_folds=nrof_folds)
             acc, best_threshold = accuracy.mean(), best_thresholds.mean()
 
             num_test_samples = len(embeddings)
